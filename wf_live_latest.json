@@ -257,7 +257,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ \"https://cyberbridge.digisac.me/api/v1/contacts/\" + $(\"Set - Normalizar Payload\").item.json.contactId + \"/ticket/transfer\" }}",
+        "url": "={{ ($env.DIGISAC_API_BASE_URL || \"https://cyberbridge.digisac.me/api/v1\") + \"/contacts/\" + $(\"Set - Normalizar Payload\").item.json.contactId + \"/ticket/transfer\" }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -288,7 +288,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://cyberbridge.digisac.me/api/v1/messages",
+        "url": "={{ ($env.DIGISAC_API_BASE_URL || \"https://cyberbridge.digisac.me/api/v1\") + \"/messages\" }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -376,7 +376,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://cyberbridge.digisac.me/api/v1/messages",
+        "url": "={{ ($env.DIGISAC_API_BASE_URL || \"https://cyberbridge.digisac.me/api/v1\") + \"/messages\" }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -407,7 +407,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://cyberbridge.digisac.me/api/v1/messages",
+        "url": "={{ ($env.DIGISAC_API_BASE_URL || \"https://cyberbridge.digisac.me/api/v1\") + \"/messages\" }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -946,7 +946,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://cyberbridge.digisac.me/api/v1/messages",
+        "url": "={{ ($env.DIGISAC_API_BASE_URL || \"https://cyberbridge.digisac.me/api/v1\") + \"/messages\" }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -976,7 +976,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://cyberbridge.digisac.me/api/v1/messages",
+        "url": "={{ ($env.DIGISAC_API_BASE_URL || \"https://cyberbridge.digisac.me/api/v1\") + \"/messages\" }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -1094,7 +1094,7 @@
     },
     {
       "parameters": {
-        "url": "={{ \"https://cyberbridge.digisac.me/api/v1/contacts?where[data.number][$iLike]=%\" + $(\"Set - Normalizar Payload\").item.json.customer_id + \"%\" }}",
+        "url": "={{ ($env.DIGISAC_API_BASE_URL || \"https://cyberbridge.digisac.me/api/v1\") + \"/contacts?where[data.number][$iLike]=%\" + $(\"Set - Normalizar Payload\").item.json.customer_id + \"%\" }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -1148,7 +1148,7 @@
     {
       "parameters": {
         "method": "PUT",
-        "url": "={{ \"https://cyberbridge.digisac.me/api/v1/contacts/\" + $(\"Code - Map Label to TagIds\").item.json.contactId }}",
+        "url": "={{ ($env.DIGISAC_API_BASE_URL || \"https://cyberbridge.digisac.me/api/v1\") + \"/contacts/\" + $(\"Code - Map Label to TagIds\").item.json.contactId }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -1178,7 +1178,7 @@
     },
     {
       "parameters": {
-        "url": "https://cyberbridge.digisac.me/api/v1/tags",
+        "url": "={{ ($env.DIGISAC_API_BASE_URL || \"https://cyberbridge.digisac.me/api/v1\") + \"/tags\" }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -1218,7 +1218,7 @@
     },
     {
       "parameters": {
-        "url": "={{ \"https://cyberbridge.digisac.me/api/v1/contacts/\" + $(\"Code - Extrair ContactId\").item.json.contactId + \"?include[0]=tags\" }}",
+        "url": "={{ ($env.DIGISAC_API_BASE_URL || \"https://cyberbridge.digisac.me/api/v1\") + \"/contacts/\" + $(\"Code - Extrair ContactId\").item.json.contactId + \"?include[0]=tags\" }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
