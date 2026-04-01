@@ -144,14 +144,18 @@ def load_decision_rules() -> Dict[str, Any]:
         "greetings": ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite"],
         "irritation_terms": ["demorando", "ninguem resolve", "frustrado", "irritado", "bloqueado", "sem acesso"],
         "handoff": {
-            "require_frustration_for_tech": True,
-            "frustration_requires_blockage": False,
             "open_ticket_when_handoff": True,
             "message_frustrated": "[BOT] Entendo a sua frustração 🙂 Vou acionar um atendente para continuar com você.",
             "message_soft_transition": "[BOT] Claro 🙂 Vou verificar a disponibilidade dele. Se preferir, já posso te orientar por aqui ou seguir com o agendamento.",
         },
         "greeting_message": "[BOT] Olá 🙂 Posso te ajudar por aqui. Me conta o que você precisa.",
         "scheduling": {"allow_on_soft_tech_request": True},
+        "anti_loop": {"enabled": True, "fallback_variations": [
+            "[BOT] Entendi 🙂 Para te ajudar melhor, qual erro aparece na tela?",
+            "[BOT] Certo 🙂 Você percebeu quando o problema começou?",
+            "[BOT] Perfeito 🙂 Isso acontece com frequência ou foi algo pontual?"
+        ]},
+        "formatting": {"max_emojis": 1, "line_break_after_period": False}
     }
     return runtime_cache.load_json(RULES_PATH, defaults)
 
@@ -161,21 +165,31 @@ def load_bot_rules() -> str:
     return runtime_cache.load_text(BOT_RULES_PATH, default_text)
 
 
-def load_client_kb(req: DecisionRequest) -> Dict[str, Any]:
+def load_client_data(req: DecisionRequest) -> Dict[str, Any]:
     KB_BASE_PATH.mkdir(parents=True, exist_ok=True)
     slug = normalize_slug(req.customer_name or req.contexto.empresa or "default")
-    kb_path = KB_BASE_PATH / f"{slug}.json"
-    default_path = KB_BASE_PATH / "default.json"
-    default_kb = {
+
+    default_root = KB_BASE_PATH / "default"
+    client_root = KB_BASE_PATH / slug
+
+    rules_default = {
+        "allow_scheduling": True,
+        "scope": "geral",
+        "restrictions": [],
+        "exclusions": [],
+        "owners": []
+    }
+    kb_default = {
         "cliente": slug,
         "escopo": "geral",
         "restricoes": [],
         "regras_especificas": [],
-        "respostas_conhecidas": {},
+        "respostas_conhecidas": {}
     }
-    if kb_path.exists():
-        return runtime_cache.load_json(kb_path, default_kb)
-    return runtime_cache.load_json(default_path, default_kb)
+
+    rules = runtime_cache.load_json(client_root / "rules.json", runtime_cache.load_json(default_root / "rules.json", rules_default))
+    kb = runtime_cache.load_json(client_root / "kb.json", runtime_cache.load_json(default_root / "kb.json", kb_default))
+    return {"slug": slug, "rules": rules, "kb": kb}
 
 
 def levenshtein_distance(a: str, b: str) -> int:
@@ -215,11 +229,13 @@ def detect_signals(req: DecisionRequest, rules: Dict[str, Any]) -> Dict[str, Any
     text_no_accent = strip_accents(text)
     greetings = {strip_accents(str(x)).lower() for x in rules.get("greetings", [])}
     irritation_terms = [strip_accents(str(x)).lower() for x in rules.get("irritation_terms", [])]
+    diagnostic_terms = ["nao funciona", "não funciona", "deslig", "erro", "trav", "sem internet", "impressora", "lento", "queda"]
 
     return {
         "text": text,
         "text_no_accent": text_no_accent,
         "only_greeting": text_no_accent in greetings,
+        "has_diagnostic_hint": any(term in text_no_accent for term in diagnostic_terms),
         "pediu_tecnico_especifico": fuzzy_contains_tech_name(text, rules),
         "cliente_irritado": any(term in text_no_accent for term in irritation_terms),
         "bloqueio_real": any(term in text_no_accent for term in ["bloque", "sem acesso", "nao consigo", "não consigo"]),
@@ -240,7 +256,50 @@ def infer_request_type(status: str, mensagem: str, previous: str) -> str:
     return previous
 
 
-def build_decision(req: DecisionRequest, *, status: str, intent: str, mensagem: str, abrir_ticket: bool, agendar: bool, handoff_humano: bool, confidence: float, source: str) -> Dict[str, Any]:
+def apply_human_format(message: str, rules: Dict[str, Any]) -> str:
+    text = (message or "").strip()
+    if not text:
+        text = "[BOT] Posso te ajudar por aqui."
+    if not text.startswith("[BOT]"):
+        text = f"[BOT] {text}"
+
+    max_emojis = int(((rules.get("formatting", {}) or {}).get("max_emojis", 1)))
+    if max_emojis <= 0:
+        text = re.sub(r"[\U0001F300-\U0001FAFF]", "", text)
+    else:
+        emojis = list(re.finditer(r"[\U0001F300-\U0001FAFF]", text))
+        for m in emojis[max_emojis:]:
+            i = m.start()
+            text = text[:i] + text[i+1:]
+
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
+def anti_loop_guard(req: DecisionRequest, message: str, rules: Dict[str, Any], signals: Dict[str, Any]) -> str:
+    if not bool((rules.get("anti_loop", {}) or {}).get("enabled", True)):
+        return message
+
+    ctx = req.contexto.model_dump()
+    previous_bot = normalize_text(str(ctx.get("last_bot_message", "")))
+    current = normalize_text(message)
+
+    generic_loop = any(p in current for p in ["me conta um pouco mais", "pode me descrever melhor", "me conte mais"])
+    repeated = previous_bot and (current == previous_bot)
+
+    if repeated or (generic_loop and signals.get("has_diagnostic_hint")):
+        variations = (rules.get("anti_loop", {}) or {}).get("fallback_variations", []) or []
+        if variations:
+            idx = int(ctx.get("tentativas", 0)) % len(variations)
+            return variations[idx]
+        return "[BOT] Entendi 🙂 Qual mensagem de erro aparece para você?"
+
+    return message
+
+
+def build_decision(req: DecisionRequest, *, status: str, intent: str, mensagem: str, abrir_ticket: bool, agendar: bool, handoff_humano: bool, confidence: float, source: str, rules: Dict[str, Any], signals: Dict[str, Any]) -> Dict[str, Any]:
+    mensagem_formatada = apply_human_format(anti_loop_guard(req, mensagem, rules, signals), rules)
+
     updated = {
         **req.contexto.model_dump(),
         "protocolo": req.protocol,
@@ -249,7 +308,9 @@ def build_decision(req: DecisionRequest, *, status: str, intent: str, mensagem: 
         "last_status": status,
         "last_intent": intent,
         "last_event_type": req.event_type,
-        "ultima_solicitacao_tipo": infer_request_type(status, mensagem, req.contexto.ultima_solicitacao_tipo or ""),
+        "last_bot_message": normalize_text(mensagem_formatada),
+        "tentativas": int(req.contexto.tentativas or 0) + 1,
+        "ultima_solicitacao_tipo": infer_request_type(status, mensagem_formatada, req.contexto.ultima_solicitacao_tipo or ""),
         "ticket_aberto": bool(req.contexto.ticket_aberto or abrir_ticket),
         "agendamento_enviado": bool(req.contexto.agendamento_enviado or agendar),
         "encerrado": bool(req.contexto.encerrado or status == "ENCERRADO"),
@@ -258,7 +319,7 @@ def build_decision(req: DecisionRequest, *, status: str, intent: str, mensagem: 
         "decisao": {
             "status": status,
             "intent": intent,
-            "mensagem": mensagem,
+            "mensagem": mensagem_formatada,
             "confidence": confidence,
             "abrir_ticket": abrir_ticket,
             "agendar": agendar,
@@ -269,18 +330,19 @@ def build_decision(req: DecisionRequest, *, status: str, intent: str, mensagem: 
     }
 
 
-def hard_rules_decision(req: DecisionRequest, signals: Dict[str, Any], rules: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def hard_rules_decision(req: DecisionRequest, signals: Dict[str, Any], rules: Dict[str, Any], client_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     handoff_cfg = rules.get("handoff", {}) or {}
     greeting_message = rules.get("greeting_message") or "[BOT] Olá 🙂 Posso te ajudar por aqui. Me conta o que você precisa."
+    allow_scheduling = bool((rules.get("scheduling", {}) or {}).get("allow_on_soft_tech_request", True)) and bool((client_data.get("rules", {}) or {}).get("allow_scheduling", True))
 
     if signals["closed_event"]:
-        return build_decision(req, status="ENCERRADO", intent="closed_cleanup", mensagem="[BOT] Atendimento finalizado.", abrir_ticket=False, agendar=False, handoff_humano=False, confidence=0.99, source="hard_rules")
+        return build_decision(req, status="ENCERRADO", intent="closed_cleanup", mensagem="[BOT] Atendimento finalizado.", abrir_ticket=False, agendar=False, handoff_humano=False, confidence=0.99, source="hard_rules", rules=rules, signals=signals)
 
     if signals["only_greeting"]:
-        return build_decision(req, status="INICIO", intent="saudacao_inicial", mensagem=greeting_message, abrir_ticket=False, agendar=False, handoff_humano=False, confidence=0.99, source="hard_rules")
+        return build_decision(req, status="INICIO", intent="saudacao_inicial", mensagem=greeting_message, abrir_ticket=False, agendar=False, handoff_humano=False, confidence=0.99, source="hard_rules", rules=rules, signals=signals)
 
     if signals["ambiguous_contact"]:
-        return build_decision(req, status="IDENTIFICACAO", intent="identificacao", mensagem="[BOT] Para seguir com segurança, me confirme seu nome completo e empresa 🙂", abrir_ticket=False, agendar=False, handoff_humano=False, confidence=0.98, source="hard_rules")
+        return build_decision(req, status="IDENTIFICACAO", intent="identificacao", mensagem="[BOT] Para seguir com segurança, me confirme seu nome completo e empresa 🙂", abrir_ticket=False, agendar=False, handoff_humano=False, confidence=0.98, source="hard_rules", rules=rules, signals=signals)
 
     if signals["pediu_tecnico_especifico"]:
         frustrated = signals["cliente_irritado"] or signals["bloqueio_real"]
@@ -295,24 +357,28 @@ def hard_rules_decision(req: DecisionRequest, signals: Dict[str, Any], rules: Di
                 handoff_humano=True,
                 confidence=0.99,
                 source="hard_rules",
+                rules=rules,
+                signals=signals,
             )
 
         return build_decision(
             req,
-            status="AGENDAMENTO" if bool((rules.get("scheduling", {}) or {}).get("allow_on_soft_tech_request", True)) else "TRIAGEM",
+            status="AGENDAMENTO" if allow_scheduling else "TRIAGEM",
             intent="preferencia_tecnico",
             mensagem=str(handoff_cfg.get("message_soft_transition") or "[BOT] Claro 🙂 Vou verificar a disponibilidade dele. Se preferir, já posso te orientar por aqui ou seguir com o agendamento."),
             abrir_ticket=False,
-            agendar=bool((rules.get("scheduling", {}) or {}).get("allow_on_soft_tech_request", True)),
+            agendar=allow_scheduling,
             handoff_humano=False,
             confidence=0.95,
             source="hard_rules",
+            rules=rules,
+            signals=signals,
         )
 
     return None
 
 
-def build_prompt(req: DecisionRequest, signals: Dict[str, Any], rules: Dict[str, Any], bot_rules: str, kb: Dict[str, Any]) -> str:
+def build_prompt(req: DecisionRequest, signals: Dict[str, Any], rules: Dict[str, Any], bot_rules: str, client_data: Dict[str, Any]) -> str:
     payload = {
         "protocol": req.protocol,
         "customer_id": req.customer_id,
@@ -327,7 +393,8 @@ def build_prompt(req: DecisionRequest, signals: Dict[str, Any], rules: Dict[str,
             "handoff": rules.get("handoff", {}),
             "scheduling": rules.get("scheduling", {}),
         },
-        "kb_cliente": kb,
+        "kb_cliente_rules": client_data.get("rules", {}),
+        "kb_cliente": client_data.get("kb", {}),
     }
     return f"""Você interpreta mensagens para um workflow DigiSAC e retorna SOMENTE JSON válido.
 
@@ -375,9 +442,8 @@ def validate_ai_response(obj: Dict[str, Any]) -> Dict[str, Any]:
     return obj
 
 
-def map_to_bridge_response(req: DecisionRequest, ai: Dict[str, Any], signals: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
-    # Guardrails operacionais: hard rules sempre prevalecem.
-    hard = hard_rules_decision(req, signals, rules)
+def map_to_bridge_response(req: DecisionRequest, ai: Dict[str, Any], signals: Dict[str, Any], rules: Dict[str, Any], client_data: Dict[str, Any]) -> Dict[str, Any]:
+    hard = hard_rules_decision(req, signals, rules, client_data)
     if hard:
         return hard
 
@@ -408,45 +474,51 @@ def map_to_bridge_response(req: DecisionRequest, ai: Dict[str, Any], signals: Di
         handoff_humano=handoff,
         confidence=float(ai.get("confidence", 0.5)),
         source="openclaw_cli_v2_1",
+        rules=rules,
+        signals=signals,
     )
 
 
 def call_openclaw(req: DecisionRequest) -> Dict[str, Any]:
     rules = load_decision_rules()
     bot_rules = load_bot_rules()
-    kb_cliente = load_client_kb(req)
+    client_data = load_client_data(req)
     signals = detect_signals(req, rules)
 
-    hard = hard_rules_decision(req, signals, rules)
+    hard = hard_rules_decision(req, signals, rules, client_data)
     if hard:
         return hard
 
-    prompt = build_prompt(req, signals, rules, bot_rules, kb_cliente)
+    prompt = build_prompt(req, signals, rules, bot_rules, client_data)
     session_id = f"digisac-{req.protocol}"
     cmd = [OPENCLAW_BIN, "agent", "--agent", OPENCLAW_AGENT, "--session-id", session_id, "--message", prompt]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=OPENCLAW_TIMEOUT)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"openclaw exited with {result.returncode}")
     ai = validate_ai_response(extract_json(result.stdout))
-    return map_to_bridge_response(req, ai, signals, rules)
+    return map_to_bridge_response(req, ai, signals, rules, client_data)
 
 
 def fallback_response(req: DecisionRequest) -> Dict[str, Any]:
     rules = load_decision_rules()
+    client_data = load_client_data(req)
     signals = detect_signals(req, rules)
-    hard = hard_rules_decision(req, signals, rules)
+    hard = hard_rules_decision(req, signals, rules, client_data)
     if hard:
         return hard
+    default_msg = "[BOT] Entendi 🙂 Para te ajudar melhor, qual erro aparece na tela?" if signals.get("has_diagnostic_hint") else "[BOT] Perfeito 🙂 Me conta um pouco mais do que está acontecendo para eu te ajudar melhor."
     return build_decision(
         req,
         status="TRIAGEM",
         intent="fallback_local",
-        mensagem="[BOT] Perfeito 🙂 Me conta um pouco mais do que está acontecendo para eu te ajudar melhor.",
+        mensagem=default_msg,
         abrir_ticket=False,
         agendar=False,
         handoff_humano=False,
         confidence=0.55,
         source="bridge_fallback_v2_1",
+        rules=rules,
+        signals=signals,
     )
 
 
@@ -460,7 +532,6 @@ def decision_openclaw(payload: DecisionRequest, authorization: Optional[str] = H
     if BRIDGE_TOKEN and authorization != f"Bearer {BRIDGE_TOKEN}":
         raise HTTPException(status_code=401, detail="unauthorized")
 
-    # isolamento: IA nunca altera o core; somente lê regras/KB externas.
     try:
         return call_openclaw(payload)
     except Exception:

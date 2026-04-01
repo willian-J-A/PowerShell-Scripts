@@ -1,0 +1,11 @@
+{
+  "cliente": "default",
+  "escopo": "atendimento geral",
+  "restricoes": [],
+  "regras_especificas": [
+    "Não encerrar atendimento sem confirmação do cliente."
+  ],
+  "respostas_conhecidas": {
+    "horario_atendimento": "[BOT] Nosso atendimento acontece em horário comercial."
+  }
+}

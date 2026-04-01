@@ -1,0 +1,7 @@
+{
+  "allow_scheduling": true,
+  "scope": "atendimento geral",
+  "restrictions": [],
+  "exclusions": [],
+  "owners": ["suporte_n1"]
+}
