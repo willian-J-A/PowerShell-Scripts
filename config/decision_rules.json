@@ -1,0 +1,33 @@
+{
+  "tech_names": ["william", "willian", "breno", "erivelton"],
+  "tech_aliases": {
+    "wiliam": "william",
+    "wilian": "willian",
+    "eriveton": "erivelton",
+    "erivelto": "erivelton"
+  },
+  "greetings": ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite"],
+  "irritation_terms": [
+    "demorando",
+    "ninguem resolve",
+    "frustrado",
+    "frustrada",
+    "irritado",
+    "irritada",
+    "bloqueado",
+    "bloqueada",
+    "sem acesso",
+    "nao consigo acessar"
+  ],
+  "handoff": {
+    "require_frustration_for_tech": true,
+    "frustration_requires_blockage": false,
+    "open_ticket_when_handoff": true,
+    "message_frustrated": "[BOT] Entendo a sua frustração 🙂 Vou acionar um atendente para continuar com você.",
+    "message_soft_transition": "[BOT] Claro 🙂 Vou verificar a disponibilidade dele. Se preferir, já posso te orientar por aqui ou seguir com o agendamento."
+  },
+  "scheduling": {
+    "allow_on_soft_tech_request": true
+  },
+  "greeting_message": "[BOT] Olá 🙂 Posso te ajudar por aqui. Me conta o que você precisa."
+}
