@@ -3,11 +3,13 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from pathlib import Path
-import os
+import hashlib
 import json
+import os
 import re
 import subprocess
 import unicodedata
+import copy
 
 app = FastAPI()
 
@@ -18,6 +20,10 @@ OPENCLAW_TIMEOUT = int(os.getenv("OPENCLAW_TIMEOUT_SECONDS", "120"))
 RULES_PATH = Path(os.getenv("DECISION_RULES_PATH", "config/decision_rules.json"))
 BOT_RULES_PATH = Path(os.getenv("BOT_RULES_PATH", "config/bot_rules.md"))
 KB_BASE_PATH = Path(os.getenv("KB_BASE_PATH", "kb/clientes"))
+STATE_BASE_PATH = Path(os.getenv("PROTOCOL_STATE_PATH", "runtime/protocols"))
+
+STATE_VERSION = "v3"
+SHORT_HISTORY_LIMIT = int(os.getenv("SHORT_HISTORY_LIMIT", "12"))
 
 ALLOWED_STATUS = {
     "INICIO", "IDENTIFICACAO", "TRIAGEM", "BASE_CONHECIMENTO", "FILA_N1",
@@ -33,22 +39,12 @@ class ContactPayload(BaseModel):
     contact_count: int = 0
 
 
-class ContextPayload(BaseModel):
-    protocolo: str = ""
-    numero: str = ""
-    nome: str = ""
-    empresa: str = ""
-    identificado: bool = False
-    triagem_concluida: bool = False
-    tentativas: int = 0
-    ticket_aberto: bool = False
-    agendamento_enviado: bool = False
-    encerrado: bool = False
-    updated_at: str = ""
-    last_status: str = ""
-    last_intent: str = ""
-    last_event_type: str = ""
-    ultima_solicitacao_tipo: str = ""
+class MessageMetaPayload(BaseModel):
+    conversation_id: Optional[str] = ""
+    ticket_id: Optional[str] = ""
+    timestamp: Optional[str] = ""
+    author: Optional[str] = "customer"
+    is_automatic: bool = False
 
 
 class KBItem(BaseModel):
@@ -62,10 +58,12 @@ class DecisionRequest(BaseModel):
     protocol: str
     customer_id: str
     customer_name: Optional[str] = ""
+    customer_company: Optional[str] = ""
     message_text: Optional[str] = ""
     event_type: Optional[str] = "message"
+    channel: Optional[str] = "digisac"
     contact: ContactPayload
-    contexto: ContextPayload
+    message_meta: Optional[MessageMetaPayload] = None
     kb_active: List[KBItem] = Field(default_factory=list)
 
 
@@ -120,21 +118,21 @@ runtime_cache = RuntimeFileCache()
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def normalize_text(text: str) -> str:
-    return ' '.join((text or '').strip().lower().split())
+    return " ".join((text or "").strip().lower().split())
 
 
 def strip_accents(text: str) -> str:
-    return ''.join(c for c in unicodedata.normalize('NFD', text or '') if unicodedata.category(c) != 'Mn')
+    return "".join(c for c in unicodedata.normalize("NFD", text or "") if unicodedata.category(c) != "Mn")
 
 
 def normalize_slug(text: str) -> str:
     base = strip_accents(text).lower().strip()
-    base = re.sub(r'[^a-z0-9]+', '_', base).strip('_')
-    return base or 'default'
+    base = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
+    return base or "default"
 
 
 def load_decision_rules() -> Dict[str, Any]:
@@ -144,38 +142,190 @@ def load_decision_rules() -> Dict[str, Any]:
         "greetings": ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite"],
         "irritation_terms": ["demorando", "ninguem resolve", "frustrado", "irritado", "bloqueado", "sem acesso"],
         "handoff": {
-            "require_frustration_for_tech": True,
-            "frustration_requires_blockage": False,
             "open_ticket_when_handoff": True,
             "message_frustrated": "[BOT] Entendo a sua frustração 🙂 Vou acionar um atendente para continuar com você.",
             "message_soft_transition": "[BOT] Claro 🙂 Vou verificar a disponibilidade dele. Se preferir, já posso te orientar por aqui ou seguir com o agendamento.",
         },
-        "greeting_message": "[BOT] Olá 🙂 Posso te ajudar por aqui. Me conta o que você precisa.",
         "scheduling": {"allow_on_soft_tech_request": True},
+        "greeting_message": "[BOT] Olá 🙂 Posso te ajudar por aqui. Me conta o que você precisa.",
+        "anti_loop": {
+            "enabled": True,
+            "fallback_variations": [
+                "[BOT] Entendi 🙂 Para avançar, você usa essa impressora por USB ou rede/Wi‑Fi?",
+                "[BOT] Perfeito 🙂 Isso acontece sempre ou só em alguns momentos?",
+                "[BOT] Certo 🙂 Você tentou reiniciar o equipamento e o computador?"
+            ]
+        },
+        "force_handoff_terms": [
+            "quero falar com atendente",
+            "quero falar com uma pessoa",
+            "me transfere",
+            "quero um humano",
+            "nao quero falar com robo",
+            "não quero falar com robô"
+        ],
+        "formatting": {"max_emojis": 1},
     }
     return runtime_cache.load_json(RULES_PATH, defaults)
 
 
 def load_bot_rules() -> str:
-    default_text = "Responda de forma cordial, clara, humana e objetiva."
-    return runtime_cache.load_text(BOT_RULES_PATH, default_text)
+    return runtime_cache.load_text(BOT_RULES_PATH, "Responda de forma cordial, clara, humana e objetiva.")
 
 
-def load_client_kb(req: DecisionRequest) -> Dict[str, Any]:
+def load_client_data(req: DecisionRequest) -> Dict[str, Any]:
     KB_BASE_PATH.mkdir(parents=True, exist_ok=True)
-    slug = normalize_slug(req.customer_name or req.contexto.empresa or "default")
-    kb_path = KB_BASE_PATH / f"{slug}.json"
-    default_path = KB_BASE_PATH / "default.json"
-    default_kb = {
+    slug = normalize_slug(req.customer_name or req.customer_company or "default")
+    default_root = KB_BASE_PATH / "default"
+    client_root = KB_BASE_PATH / slug
+
+    rules_default = {
+        "allow_scheduling": True,
+        "scope": "geral",
+        "restrictions": [],
+        "exclusions": [],
+        "owners": []
+    }
+    kb_default = {
         "cliente": slug,
         "escopo": "geral",
         "restricoes": [],
         "regras_especificas": [],
-        "respostas_conhecidas": {},
+        "respostas_conhecidas": {}
     }
-    if kb_path.exists():
-        return runtime_cache.load_json(kb_path, default_kb)
-    return runtime_cache.load_json(default_path, default_kb)
+
+    rules = runtime_cache.load_json(client_root / "rules.json", runtime_cache.load_json(default_root / "rules.json", rules_default))
+    kb = runtime_cache.load_json(client_root / "kb.json", runtime_cache.load_json(default_root / "kb.json", kb_default))
+    return {"slug": slug, "rules": rules, "kb": kb}
+
+
+def protocol_state_path(protocol: str) -> Path:
+    safe_protocol = re.sub(r"[^0-9A-Za-z_-]+", "_", protocol)
+    return STATE_BASE_PATH / f"{safe_protocol}.json"
+
+
+def new_state(req: DecisionRequest) -> Dict[str, Any]:
+    now = now_iso()
+    return {
+        "protocol": req.protocol,
+        "is_open": True,
+        "created_at": now,
+        "updated_at": now,
+        "customer": {
+            "id": req.customer_id,
+            "name": req.customer_name or "",
+            "company": req.customer_company or "",
+        },
+        "conversation": {
+            "last_user_message": "",
+            "last_bot_message": "",
+            "ultima_pergunta_bot": "",
+            "ultima_resposta_cliente": "",
+            "historico_curto": [],
+            "historico_completo": [],
+        },
+        "workflow": {
+            "status": "INICIO",
+            "intent": "",
+            "tentativas": 0,
+            "triagem_concluida": False,
+            "encerrado": False,
+            "aguardando_validacao": False,
+            "ultima_solicitacao_tipo": "",
+        },
+        "ticket": {"aberto": False, "ticket_id": None, "opened_at": None},
+        "handoff": {"realizado": False, "motivo": None, "timestamp": None},
+        "agendamento": {"enviado": False, "timestamp": None},
+        "solution": {"proposta": False, "validada": False, "solucionado": False},
+        "last_execution": {"input_payload": {}, "decision_output": {}, "actions_taken": [], "event_id": ""},
+    }
+
+
+def load_protocol_state(req: DecisionRequest) -> Dict[str, Any]:
+    STATE_BASE_PATH.mkdir(parents=True, exist_ok=True)
+    p = protocol_state_path(req.protocol)
+    if p.exists():
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception:
+            pass
+    return new_state(req)
+
+
+def save_protocol_state(protocol: str, state: Dict[str, Any]) -> None:
+    STATE_BASE_PATH.mkdir(parents=True, exist_ok=True)
+    p = protocol_state_path(protocol)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def archive_protocol_state(protocol: str) -> None:
+    p = protocol_state_path(protocol)
+    if not p.exists():
+        return
+    arch = STATE_BASE_PATH / "archived"
+    arch.mkdir(parents=True, exist_ok=True)
+    target = arch / f"{protocol}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    p.rename(target)
+
+
+def normalize_event(req: DecisionRequest) -> Dict[str, Any]:
+    meta = req.message_meta.model_dump() if req.message_meta else {}
+    text = (req.message_text or "").strip()
+    timestamp = meta.get("timestamp") or now_iso()
+    author = (meta.get("author") or "customer").lower()
+    is_automatic = bool(meta.get("is_automatic", False)) or "mensagem automática" in strip_accents(text).lower()
+
+    event_key = f"{req.protocol}|{req.customer_id}|{req.event_type}|{author}|{timestamp}|{normalize_text(text)}"
+    event_id = hashlib.sha1(event_key.encode("utf-8")).hexdigest()
+
+    return {
+        "protocol": req.protocol,
+        "customer_id": req.customer_id,
+        "customer_name": req.customer_name or "",
+        "customer_company": req.customer_company or "",
+        "channel": req.channel or "digisac",
+        "event_type": req.event_type or "message",
+        "message_text": text,
+        "timestamp": timestamp,
+        "author": author,
+        "is_automatic": is_automatic,
+        "contact": req.contact.model_dump(),
+        "message_meta": meta,
+        "event_id": event_id,
+        "raw_payload": req.model_dump(),
+    }
+
+
+def append_history(state: Dict[str, Any], role: str, text: str, timestamp: str, source: str) -> None:
+    item = {"role": role, "text": text, "timestamp": timestamp, "source": source}
+    hist = state["conversation"]["historico_completo"]
+    if hist and hist[-1].get("role") == role and normalize_text(hist[-1].get("text", "")) == normalize_text(text):
+        return
+    hist.append(item)
+    short = state["conversation"]["historico_curto"]
+    short.append({"role": role, "text": text})
+    if len(short) > SHORT_HISTORY_LIMIT:
+        state["conversation"]["historico_curto"] = short[-SHORT_HISTORY_LIMIT:]
+
+
+def consolidate_state(state: Dict[str, Any], event: Dict[str, Any]) -> Dict[str, Any]:
+    state["updated_at"] = now_iso()
+    state["customer"]["id"] = event["customer_id"]
+    if event["customer_name"]:
+        state["customer"]["name"] = event["customer_name"]
+    if event["customer_company"]:
+        state["customer"]["company"] = event["customer_company"]
+
+    if not event["is_automatic"] and event["author"] in {"customer", "client", "usuario", "user"} and event["message_text"]:
+        state["conversation"]["last_user_message"] = event["message_text"]
+        state["conversation"]["ultima_resposta_cliente"] = event["message_text"]
+        append_history(state, "user", event["message_text"], event["timestamp"], event["channel"])
+
+    return state
 
 
 def levenshtein_distance(a: str, b: str) -> int:
@@ -199,10 +349,8 @@ def fuzzy_contains_tech_name(text: str, rules: Dict[str, Any]) -> bool:
     tokens = re.findall(r"[a-z]+", base)
     aliases = rules.get("tech_aliases", {}) or {}
     names = [strip_accents(str(n)).lower() for n in rules.get("tech_names", [])]
-
     if any(name in base for name in names):
         return True
-
     for token in [aliases.get(t, t) for t in tokens]:
         for target in names:
             if abs(len(token) - len(target)) <= 1 and levenshtein_distance(token, target) <= 1:
@@ -210,11 +358,12 @@ def fuzzy_contains_tech_name(text: str, rules: Dict[str, Any]) -> bool:
     return False
 
 
-def detect_signals(req: DecisionRequest, rules: Dict[str, Any]) -> Dict[str, Any]:
-    text = normalize_text(req.message_text or '')
+def detect_signals(state: Dict[str, Any], event: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
+    text = normalize_text(event["message_text"])
     text_no_accent = strip_accents(text)
     greetings = {strip_accents(str(x)).lower() for x in rules.get("greetings", [])}
     irritation_terms = [strip_accents(str(x)).lower() for x in rules.get("irritation_terms", [])]
+    force_handoff_terms = [strip_accents(str(x)).lower() for x in rules.get("force_handoff_terms", [])]
 
     return {
         "text": text,
@@ -222,9 +371,11 @@ def detect_signals(req: DecisionRequest, rules: Dict[str, Any]) -> Dict[str, Any
         "only_greeting": text_no_accent in greetings,
         "pediu_tecnico_especifico": fuzzy_contains_tech_name(text, rules),
         "cliente_irritado": any(term in text_no_accent for term in irritation_terms),
+        "pedido_humano_explicito": any(term in text_no_accent for term in force_handoff_terms),
         "bloqueio_real": any(term in text_no_accent for term in ["bloque", "sem acesso", "nao consigo", "não consigo"]),
-        "ambiguous_contact": bool(req.contact.ambiguous_contact),
-        "closed_event": req.event_type in {"closed", "conversation_closed", "finalized"} or bool(req.contexto.encerrado),
+        "closed_event": event["event_type"] in {"closed", "conversation_closed", "finalized"} or bool(state["workflow"].get("encerrado")),
+        "ambiguous_contact": bool(event["contact"].get("ambiguous_contact", False)),
+        "has_diagnostic_hint": any(term in text_no_accent for term in ["nao funciona", "não funciona", "deslig", "erro", "impressora", "internet", "lento"]),
     }
 
 
@@ -237,98 +388,80 @@ def infer_request_type(status: str, mensagem: str, previous: str) -> str:
         return "agendamento"
     if status == "FILA_N1":
         return "handoff"
-    return previous
+    return previous or ""
 
 
-def build_decision(req: DecisionRequest, *, status: str, intent: str, mensagem: str, abrir_ticket: bool, agendar: bool, handoff_humano: bool, confidence: float, source: str) -> Dict[str, Any]:
-    updated = {
-        **req.contexto.model_dump(),
-        "protocolo": req.protocol,
-        "numero": req.customer_id,
-        "updated_at": now_iso(),
-        "last_status": status,
-        "last_intent": intent,
-        "last_event_type": req.event_type,
-        "ultima_solicitacao_tipo": infer_request_type(status, mensagem, req.contexto.ultima_solicitacao_tipo or ""),
-        "ticket_aberto": bool(req.contexto.ticket_aberto or abrir_ticket),
-        "agendamento_enviado": bool(req.contexto.agendamento_enviado or agendar),
-        "encerrado": bool(req.contexto.encerrado or status == "ENCERRADO"),
-    }
-    return {
-        "decisao": {
-            "status": status,
-            "intent": intent,
-            "mensagem": mensagem,
-            "confidence": confidence,
-            "abrir_ticket": abrir_ticket,
-            "agendar": agendar,
-            "handoff_humano": handoff_humano,
+def apply_human_format(message: str, rules: Dict[str, Any]) -> str:
+    text = (message or "").strip()
+    if not text:
+        text = "[BOT] Posso te ajudar por aqui."
+    if not text.startswith("[BOT]"):
+        text = f"[BOT] {text}"
+
+    max_emojis = int(((rules.get("formatting", {}) or {}).get("max_emojis", 1)))
+    if max_emojis <= 0:
+        text = re.sub(r"[\U0001F300-\U0001FAFF]", "", text)
+    else:
+        emojis = list(re.finditer(r"[\U0001F300-\U0001FAFF]", text))
+        for m in emojis[max_emojis:]:
+            i = m.start()
+            text = text[:i] + text[i + 1:]
+
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def anti_loop_guard(state: Dict[str, Any], message: str, rules: Dict[str, Any], signals: Dict[str, Any]) -> str:
+    if not bool((rules.get("anti_loop", {}) or {}).get("enabled", True)):
+        return message
+
+    prev = normalize_text(state["conversation"].get("last_bot_message", ""))
+    curr = normalize_text(message)
+    last_user = normalize_text(state["conversation"].get("last_user_message", ""))
+
+    repeated = bool(prev and curr == prev)
+    generic_loop = any(p in curr for p in ["me conta um pouco mais", "pode me descrever melhor", "me conte mais"])
+
+    if repeated or (generic_loop and signals.get("has_diagnostic_hint") and last_user):
+        variations = (rules.get("anti_loop", {}) or {}).get("fallback_variations", []) or []
+        if variations:
+            idx = int(state["workflow"].get("tentativas", 0)) % len(variations)
+            return variations[idx]
+        return "[BOT] Entendi 🙂 Qual mensagem de erro aparece para você?"
+    return message
+
+
+def build_prompt(state: Dict[str, Any], event: Dict[str, Any], signals: Dict[str, Any], rules: Dict[str, Any], bot_rules: str, client_data: Dict[str, Any]) -> str:
+    contexto = {
+        "ultima_pergunta_bot": state["conversation"].get("ultima_pergunta_bot", ""),
+        "ultima_resposta_cliente": state["conversation"].get("ultima_resposta_cliente", ""),
+        "historico_curto": state["conversation"].get("historico_curto", []),
+        "resumo_turno": {
+            "last_status": state["workflow"].get("status", "INICIO"),
+            "last_intent": state["workflow"].get("intent", ""),
+            "ultima_solicitacao_tipo": state["workflow"].get("ultima_solicitacao_tipo", ""),
+            "tentativas": state["workflow"].get("tentativas", 0),
         },
-        "contexto_atualizado": updated,
-        "meta": {"source": source, "fallback_used": source != "openclaw_cli_v2_1"},
+        "last_bot_message": normalize_text(state["conversation"].get("last_bot_message", "")),
     }
 
-
-def hard_rules_decision(req: DecisionRequest, signals: Dict[str, Any], rules: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    handoff_cfg = rules.get("handoff", {}) or {}
-    greeting_message = rules.get("greeting_message") or "[BOT] Olá 🙂 Posso te ajudar por aqui. Me conta o que você precisa."
-
-    if signals["closed_event"]:
-        return build_decision(req, status="ENCERRADO", intent="closed_cleanup", mensagem="[BOT] Atendimento finalizado.", abrir_ticket=False, agendar=False, handoff_humano=False, confidence=0.99, source="hard_rules")
-
-    if signals["only_greeting"]:
-        return build_decision(req, status="INICIO", intent="saudacao_inicial", mensagem=greeting_message, abrir_ticket=False, agendar=False, handoff_humano=False, confidence=0.99, source="hard_rules")
-
-    if signals["ambiguous_contact"]:
-        return build_decision(req, status="IDENTIFICACAO", intent="identificacao", mensagem="[BOT] Para seguir com segurança, me confirme seu nome completo e empresa 🙂", abrir_ticket=False, agendar=False, handoff_humano=False, confidence=0.98, source="hard_rules")
-
-    if signals["pediu_tecnico_especifico"]:
-        frustrated = signals["cliente_irritado"] or signals["bloqueio_real"]
-        if frustrated:
-            return build_decision(
-                req,
-                status="FILA_N1",
-                intent="handoff_humano",
-                mensagem=str(handoff_cfg.get("message_frustrated") or "[BOT] Entendo a sua frustração 🙂 Vou acionar um atendente para continuar com você."),
-                abrir_ticket=bool(handoff_cfg.get("open_ticket_when_handoff", True)),
-                agendar=False,
-                handoff_humano=True,
-                confidence=0.99,
-                source="hard_rules",
-            )
-
-        return build_decision(
-            req,
-            status="AGENDAMENTO" if bool((rules.get("scheduling", {}) or {}).get("allow_on_soft_tech_request", True)) else "TRIAGEM",
-            intent="preferencia_tecnico",
-            mensagem=str(handoff_cfg.get("message_soft_transition") or "[BOT] Claro 🙂 Vou verificar a disponibilidade dele. Se preferir, já posso te orientar por aqui ou seguir com o agendamento."),
-            abrir_ticket=False,
-            agendar=bool((rules.get("scheduling", {}) or {}).get("allow_on_soft_tech_request", True)),
-            handoff_humano=False,
-            confidence=0.95,
-            source="hard_rules",
-        )
-
-    return None
-
-
-def build_prompt(req: DecisionRequest, signals: Dict[str, Any], rules: Dict[str, Any], bot_rules: str, kb: Dict[str, Any]) -> str:
     payload = {
-        "protocol": req.protocol,
-        "customer_id": req.customer_id,
-        "customer_name": req.customer_name,
-        "message_text": req.message_text,
-        "event_type": req.event_type,
-        "contact": req.contact.model_dump(),
-        "contexto": req.contexto.model_dump(),
+        "protocol": event["protocol"],
+        "customer_id": event["customer_id"],
+        "customer_name": state["customer"].get("name", ""),
+        "message_text": event["message_text"],
+        "event_type": event["event_type"],
+        "contact": event["contact"],
+        "contexto": contexto,
         "signals": signals,
         "decision_policy_excerpt": {
             "greetings": rules.get("greetings", []),
             "handoff": rules.get("handoff", {}),
             "scheduling": rules.get("scheduling", {}),
         },
-        "kb_cliente": kb,
+        "kb_cliente_rules": client_data.get("rules", {}),
+        "kb_cliente": client_data.get("kb", {}),
     }
+
     return f"""Você interpreta mensagens para um workflow DigiSAC e retorna SOMENTE JSON válido.
 
 Instruções de comportamento (bot_rules):
@@ -345,16 +478,16 @@ Contexto:
 
 
 def extract_json(text: str) -> Dict[str, Any]:
-    text = (text or "").strip()
-    if not text:
+    raw = (text or "").strip()
+    if not raw:
         raise ValueError("empty response")
     try:
-        return json.loads(text)
+        return json.loads(raw)
     except Exception:
-        start = text.find("{")
-        end = text.rfind("}")
+        start = raw.find("{")
+        end = raw.rfind("}")
         if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
+            return json.loads(raw[start:end + 1])
         raise
 
 
@@ -375,93 +508,313 @@ def validate_ai_response(obj: Dict[str, Any]) -> Dict[str, Any]:
     return obj
 
 
-def map_to_bridge_response(req: DecisionRequest, ai: Dict[str, Any], signals: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
-    # Guardrails operacionais: hard rules sempre prevalecem.
-    hard = hard_rules_decision(req, signals, rules)
-    if hard:
-        return hard
+def build_contexto_atualizado(state: Dict[str, Any], event_type: str) -> Dict[str, Any]:
+    return {
+        "protocolo": state["protocol"],
+        "numero": state["customer"].get("id", ""),
+        "nome": state["customer"].get("name", ""),
+        "empresa": state["customer"].get("company", ""),
+        "identificado": False,
+        "triagem_concluida": bool(state["workflow"].get("triagem_concluida", False)),
+        "tentativas": int(state["workflow"].get("tentativas", 0)),
+        "ticket_aberto": bool(state["ticket"].get("aberto", False)),
+        "agendamento_enviado": bool(state["agendamento"].get("enviado", False)),
+        "encerrado": bool(state["workflow"].get("encerrado", False)),
+        "updated_at": state.get("updated_at", now_iso()),
+        "last_status": state["workflow"].get("status", "INICIO"),
+        "last_intent": state["workflow"].get("intent", ""),
+        "last_event_type": event_type,
+        "ultima_solicitacao_tipo": state["workflow"].get("ultima_solicitacao_tipo", ""),
+        "ultima_pergunta_bot": state["conversation"].get("ultima_pergunta_bot", ""),
+        "ultima_resposta_cliente": state["conversation"].get("ultima_resposta_cliente", ""),
+        "historico_curto": state["conversation"].get("historico_curto", []),
+        "resumo_turno": {
+            "last_status": state["workflow"].get("status", "INICIO"),
+            "last_intent": state["workflow"].get("intent", ""),
+            "ultima_solicitacao_tipo": state["workflow"].get("ultima_solicitacao_tipo", ""),
+            "tentativas": int(state["workflow"].get("tentativas", 0)),
+        },
+        "last_bot_message": normalize_text(state["conversation"].get("last_bot_message", "")),
+    }
 
-    status = ai.get("status_sugerido") or "TRIAGEM"
-    intent = ai.get("intent") or "fallback_local"
-    mensagem = ai.get("mensagem", "")
-    handoff = bool(ai.get("recomenda_handoff_humano", False))
-    abrir_ticket = bool(ai.get("recomenda_abrir_ticket", False))
-    agendar = bool(ai.get("recomenda_agendamento", False))
+
+def hard_rules_decision(state: Dict[str, Any], event: Dict[str, Any], signals: Dict[str, Any], rules: Dict[str, Any], client_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if event["is_automatic"]:
+        return {
+            "status": state["workflow"].get("status", "INICIO"),
+            "intent": "ignorar_mensagem_automatica",
+            "mensagem": "[BOT]",
+            "confidence": 1.0,
+            "abrir_ticket": False,
+            "agendar": False,
+            "handoff_humano": False,
+            "motivo": "automatic_message_ignored",
+        }
+
+    if signals["closed_event"]:
+        return {
+            "status": "ENCERRADO",
+            "intent": "closed_cleanup",
+            "mensagem": "[BOT] Atendimento finalizado.",
+            "confidence": 0.99,
+            "abrir_ticket": False,
+            "agendar": False,
+            "handoff_humano": False,
+            "motivo": "closed_event",
+        }
+
+    if signals["pedido_humano_explicito"]:
+        return {
+            "status": "FILA_N1",
+            "intent": "handoff_humano",
+            "mensagem": str((rules.get("handoff", {}) or {}).get("message_frustrated", "[BOT] Entendo 🙂 Vou transferir você para um atendente humano agora.")),
+            "confidence": 0.99,
+            "abrir_ticket": True,
+            "agendar": False,
+            "handoff_humano": True,
+            "motivo": "pedido_humano_explicito",
+        }
+
+    if signals["only_greeting"] and state["workflow"].get("tentativas", 0) == 0:
+        return {
+            "status": "INICIO",
+            "intent": "saudacao_inicial",
+            "mensagem": rules.get("greeting_message", "[BOT] Olá 🙂 Posso te ajudar por aqui. Me conta o que você precisa."),
+            "confidence": 0.98,
+            "abrir_ticket": False,
+            "agendar": False,
+            "handoff_humano": False,
+            "motivo": "greeting",
+        }
+
+    if signals["ambiguous_contact"]:
+        return {
+            "status": "IDENTIFICACAO",
+            "intent": "identificacao",
+            "mensagem": "[BOT] Para seguir com segurança, me confirme seu nome completo e empresa 🙂",
+            "confidence": 0.98,
+            "abrir_ticket": False,
+            "agendar": False,
+            "handoff_humano": False,
+            "motivo": "ambiguous_contact",
+        }
+
+    if signals["pediu_tecnico_especifico"]:
+        frustrated = signals["cliente_irritado"] or signals["bloqueio_real"]
+        allow_scheduling = bool((rules.get("scheduling", {}) or {}).get("allow_on_soft_tech_request", True)) and bool((client_data.get("rules", {}) or {}).get("allow_scheduling", True))
+        if frustrated:
+            return {
+                "status": "FILA_N1",
+                "intent": "handoff_humano",
+                "mensagem": str((rules.get("handoff", {}) or {}).get("message_frustrated", "[BOT] Entendo a sua frustração 🙂 Vou acionar um atendente para continuar com você.")),
+                "confidence": 0.99,
+                "abrir_ticket": True,
+                "agendar": False,
+                "handoff_humano": True,
+                "motivo": "tech_request_with_frustration",
+            }
+        return {
+            "status": "AGENDAMENTO" if allow_scheduling else "TRIAGEM",
+            "intent": "preferencia_tecnico",
+            "mensagem": str((rules.get("handoff", {}) or {}).get("message_soft_transition", "[BOT] Claro 🙂 Posso seguir por aqui ou já deixar o agendamento preparado.")),
+            "confidence": 0.95,
+            "abrir_ticket": False,
+            "agendar": allow_scheduling,
+            "handoff_humano": False,
+            "motivo": "tech_request_soft",
+        }
+
+    return None
+
+
+def call_openclaw(state: Dict[str, Any], event: Dict[str, Any], signals: Dict[str, Any], rules: Dict[str, Any], bot_rules: str, client_data: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = build_prompt(state, event, signals, rules, bot_rules, client_data)
+    session_id = f"digisac-{event['protocol']}"
+    cmd = [OPENCLAW_BIN, "agent", "--agent", OPENCLAW_AGENT, "--session-id", session_id, "--message", prompt]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=OPENCLAW_TIMEOUT)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"openclaw exited with {result.returncode}")
+    ai = validate_ai_response(extract_json(result.stdout))
+    ai["_raw_excerpt"] = (result.stdout or "")[:220]
+    return ai
+
+
+def apply_guardrails_to_decision(state: Dict[str, Any], raw: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
+    status = raw.get("status") or raw.get("status_sugerido") or "TRIAGEM"
+    intent = raw.get("intent", "fallback_local")
+    mensagem = raw.get("mensagem", "")
+    confidence = float(raw.get("confidence", 0.5))
+    handoff = bool(raw.get("handoff_humano") if "handoff_humano" in raw else raw.get("recomenda_handoff_humano", False))
+    abrir_ticket = bool(raw.get("abrir_ticket") if "abrir_ticket" in raw else raw.get("recomenda_abrir_ticket", False))
+    agendar = bool(raw.get("agendar") if "agendar" in raw else raw.get("recomenda_agendamento", False))
+
+    actions_taken: List[str] = []
+
+    # idempotência operacional de handoff/ticket
+    if state["handoff"].get("realizado"):
+        handoff = False
+        abrir_ticket = False
+        actions_taken.append("handoff_skipped_already_done")
 
     if handoff:
         status = "FILA_N1"
         intent = "handoff_humano"
-        abrir_ticket = bool((rules.get("handoff", {}) or {}).get("open_ticket_when_handoff", True))
+        if not state["ticket"].get("aberto"):
+            abrir_ticket = bool((rules.get("handoff", {}) or {}).get("open_ticket_when_handoff", True))
+            if abrir_ticket:
+                actions_taken.append("ticket_open_required")
+        else:
+            abrir_ticket = False
+            actions_taken.append("ticket_reused_existing")
         agendar = False
 
     if status == "AGENDAMENTO":
         agendar = True
         handoff = False
 
-    return build_decision(
-        req,
-        status=status,
-        intent=intent,
-        mensagem=mensagem,
-        abrir_ticket=abrir_ticket,
-        agendar=agendar,
-        handoff_humano=handoff,
-        confidence=float(ai.get("confidence", 0.5)),
-        source="openclaw_cli_v2_1",
-    )
+    if state["workflow"].get("encerrado") and status != "ENCERRADO":
+        status = "ENCERRADO"
+        intent = "closed_already"
+        mensagem = "[BOT] Este atendimento já foi encerrado."
+        handoff = False
+        agendar = False
+        abrir_ticket = False
+        actions_taken.append("locked_closed_state")
+
+    return {
+        "status": status,
+        "intent": intent,
+        "mensagem": mensagem,
+        "confidence": confidence,
+        "abrir_ticket": abrir_ticket,
+        "agendar": agendar,
+        "handoff_humano": handoff,
+        "actions_taken": actions_taken,
+        "raw_output_excerpt": raw.get("_raw_excerpt", ""),
+    }
 
 
-def call_openclaw(req: DecisionRequest) -> Dict[str, Any]:
+def persist_decision(state: Dict[str, Any], event: Dict[str, Any], decision: Dict[str, Any], rules: Dict[str, Any], signals: Dict[str, Any], source: str, fallback_used: bool) -> Dict[str, Any]:
+    is_automatic_ignored = decision["intent"] == "ignorar_mensagem_automatica"
+    if is_automatic_ignored:
+        msg = ""
+    else:
+        msg = apply_human_format(anti_loop_guard(state, decision["mensagem"], rules, signals), rules)
+
+    state["workflow"]["status"] = decision["status"]
+    state["workflow"]["intent"] = decision["intent"]
+    state["workflow"]["tentativas"] = int(state["workflow"].get("tentativas", 0)) + (0 if event["is_automatic"] else 1)
+    state["workflow"]["encerrado"] = bool(state["workflow"].get("encerrado") or decision["status"] == "ENCERRADO")
+    state["workflow"]["ultima_solicitacao_tipo"] = infer_request_type(decision["status"], msg, state["workflow"].get("ultima_solicitacao_tipo", ""))
+
+    if decision["abrir_ticket"] and not state["ticket"].get("aberto"):
+        state["ticket"]["aberto"] = True
+        state["ticket"]["opened_at"] = now_iso()
+
+    if decision["handoff_humano"] and not state["handoff"].get("realizado"):
+        state["handoff"]["realizado"] = True
+        state["handoff"]["motivo"] = decision["intent"]
+        state["handoff"]["timestamp"] = now_iso()
+
+    if decision["agendar"]:
+        state["agendamento"]["enviado"] = True
+        state["agendamento"]["timestamp"] = now_iso()
+
+    if decision["status"] == "ENCERRADO":
+        state["is_open"] = False
+
+    if msg and msg != "[BOT]":
+        state["conversation"]["last_bot_message"] = msg
+        if "?" in msg:
+            state["conversation"]["ultima_pergunta_bot"] = msg
+        append_history(state, "assistant", msg, now_iso(), "bridge")
+
+    state["updated_at"] = now_iso()
+
+    output = {
+        "decisao": {
+            "status": decision["status"],
+            "intent": decision["intent"],
+            "mensagem": msg,
+            "confidence": decision["confidence"],
+            "abrir_ticket": decision["abrir_ticket"],
+            "agendar": decision["agendar"],
+            "handoff_humano": decision["handoff_humano"],
+        },
+        "contexto_atualizado": build_contexto_atualizado(state, event["event_type"]),
+        "meta": {
+            "source": source,
+            "fallback_used": fallback_used,
+            "state_persisted": True,
+            "state_version": STATE_VERSION,
+            "raw_output_excerpt": decision.get("raw_output_excerpt", "")[:220],
+        },
+    }
+
+    state["last_execution"] = {
+        "input_payload": event["raw_payload"],
+        "decision_output": output,
+        "actions_taken": decision.get("actions_taken", []),
+        "event_id": event["event_id"],
+    }
+
+    save_protocol_state(event["protocol"], state)
+    return output
+
+
+def run_decision(req: DecisionRequest) -> Dict[str, Any]:
     rules = load_decision_rules()
     bot_rules = load_bot_rules()
-    kb_cliente = load_client_kb(req)
-    signals = detect_signals(req, rules)
+    client_data = load_client_data(req)
 
-    hard = hard_rules_decision(req, signals, rules)
+    state = load_protocol_state(req)
+    event = normalize_event(req)
+
+    # idempotência por evento
+    if state.get("last_execution", {}).get("event_id") == event["event_id"] and state.get("last_execution", {}).get("decision_output"):
+        replay = copy.deepcopy(state["last_execution"]["decision_output"])
+        replay["meta"]["source"] = "idempotent_replay"
+        return replay
+
+    state = consolidate_state(state, event)
+    signals = detect_signals(state, event, rules)
+
+    hard = hard_rules_decision(state, event, signals, rules, client_data)
     if hard:
-        return hard
+        final = apply_guardrails_to_decision(state, hard, rules)
+        return persist_decision(state, event, final, rules, signals, source="hard_rules", fallback_used=False)
 
-    prompt = build_prompt(req, signals, rules, bot_rules, kb_cliente)
-    session_id = f"digisac-{req.protocol}"
-    cmd = [OPENCLAW_BIN, "agent", "--agent", OPENCLAW_AGENT, "--session-id", session_id, "--message", prompt]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=OPENCLAW_TIMEOUT)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"openclaw exited with {result.returncode}")
-    ai = validate_ai_response(extract_json(result.stdout))
-    return map_to_bridge_response(req, ai, signals, rules)
-
-
-def fallback_response(req: DecisionRequest) -> Dict[str, Any]:
-    rules = load_decision_rules()
-    signals = detect_signals(req, rules)
-    hard = hard_rules_decision(req, signals, rules)
-    if hard:
-        return hard
-    return build_decision(
-        req,
-        status="TRIAGEM",
-        intent="fallback_local",
-        mensagem="[BOT] Perfeito 🙂 Me conta um pouco mais do que está acontecendo para eu te ajudar melhor.",
-        abrir_ticket=False,
-        agendar=False,
-        handoff_humano=False,
-        confidence=0.55,
-        source="bridge_fallback_v2_1",
-    )
+    try:
+        ai = call_openclaw(state, event, signals, rules, bot_rules, client_data)
+        final = apply_guardrails_to_decision(state, ai, rules)
+        return persist_decision(state, event, final, rules, signals, source="openclaw_cli_v2_1", fallback_used=False)
+    except Exception:
+        fallback = {
+            "status": "TRIAGEM",
+            "intent": "fallback_local",
+            "mensagem": "[BOT] Entendi 🙂 Para avançar, você consegue me dizer quando esse problema começou?",
+            "confidence": 0.55,
+            "abrir_ticket": False,
+            "agendar": False,
+            "handoff_humano": False,
+            "actions_taken": ["fallback_response"],
+        }
+        final = apply_guardrails_to_decision(state, fallback, rules)
+        return persist_decision(state, event, final, rules, signals, source="bridge_fallback_v3", fallback_used=True)
 
 
 @app.get("/health")
-def health():
-    return {"ok": True, "service": "openclaw-decision-bridge", "mode": "openclaw-cli-v2_1"}
+def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "service": "openclaw-decision-bridge",
+        "mode": "openclaw-cli-v2_1",
+        "state_version": STATE_VERSION,
+    }
 
 
 @app.post("/decision/openclaw")
-def decision_openclaw(payload: DecisionRequest, authorization: Optional[str] = Header(default="")):
+def decision_openclaw(payload: DecisionRequest, authorization: Optional[str] = Header(default="")) -> Dict[str, Any]:
     if BRIDGE_TOKEN and authorization != f"Bearer {BRIDGE_TOKEN}":
         raise HTTPException(status_code=401, detail="unauthorized")
-
-    # isolamento: IA nunca altera o core; somente lê regras/KB externas.
-    try:
-        return call_openclaw(payload)
-    except Exception:
-        return fallback_response(payload)
+    return run_decision(payload)
