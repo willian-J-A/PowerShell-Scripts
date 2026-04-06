@@ -732,6 +732,8 @@ def apply_guardrails_to_decision(state: Dict[str, Any], raw: Dict[str, Any], rul
     agendar = bool(raw.get("agendar") if "agendar" in raw else raw.get("recomenda_agendamento", False))
     analysis = raw.get("analysis", {}) or {}
     should_change_path = bool(analysis.get("should_change_path", False))
+    same_diagnostic_path = bool(analysis.get("same_diagnostic_path", False))
+    user_answered_previous = bool(analysis.get("user_answered_previous", False))
 
     actions_taken: List[str] = []
 
@@ -757,19 +759,39 @@ def apply_guardrails_to_decision(state: Dict[str, Any], raw: Dict[str, Any], rul
         agendar = True
         handoff = False
 
-    # Telemetria semântica da IA passa a influenciar guardrails operacionais.
-    if should_change_path and not handoff:
-        status = "TRIAGEM"
-        intent = "mudanca_trilha_semantica"
-        mensagem = "[BOT] Entendi. Vou mudar a abordagem para avançarmos melhor: qual é o impacto agora, total ou parcial?"
-        actions_taken.append("semantic_path_change_applied")
+    # Degradação progressiva por nível de repetição/travamento.
+    same_intent = int(state["workflow"].get("tentativas_mesma_intencao", 0))
+    repeated_collect = int(state["workflow"].get("coletas_repetidas", 0))
+    repeat_score = 0
+    repeat_score += 1 if should_change_path else 0
+    repeat_score += 1 if same_diagnostic_path else 0
+    repeat_score += 1 if user_answered_previous else 0
+    repeat_score += 2 if same_intent >= 3 else (1 if same_intent >= 2 else 0)
+    repeat_score += 1 if repeated_collect >= 2 else 0
 
-    # Contadores operacionais passam a dirigir quebra de repetição.
-    if (int(state["workflow"].get("tentativas_mesma_intencao", 0)) >= 2 or int(state["workflow"].get("coletas_repetidas", 0)) >= 2) and not handoff:
+    base_message = (mensagem or "").strip()
+    if not base_message:
+        base_message = "[BOT] Entendi."
+
+    # Prioridade explícita: alto -> médio -> leve
+    if repeat_score >= 4 and not handoff:
+        status = "FILA_N1"
+        intent = "handoff_por_repeticao"
+        handoff = True
+        abrir_ticket = bool((rules.get("handoff", {}) or {}).get("open_ticket_when_handoff", True))
+        agendar = False
+        mensagem = f"{base_message} Vou te encaminhar para um especialista humano para acelerar a solução."
+        actions_taken.append("escalation_high_repetition")
+    elif repeat_score >= 2 and not handoff:
         status = "TRIAGEM"
         intent = "quebra_repeticao_operacional"
-        mensagem = "[BOT] Para destravar, vamos por outro caminho: isso está parando sua operação totalmente ou parcialmente?"
+        mensagem = f"{base_message} Para destravar, vou mudar o caminho: isso impacta sua operação total ou parcialmente?"
         actions_taken.append("operational_path_break")
+    elif (repeat_score == 1) and not handoff:
+        status = "TRIAGEM"
+        intent = "mudanca_trilha_semantica"
+        mensagem = f"{base_message} Vamos ajustar a abordagem para avançar melhor."
+        actions_taken.append("semantic_path_change_applied")
 
     # Evita ficar preso no subfluxo de identificação indefinidamente.
     if status == "IDENTIFICACAO":
