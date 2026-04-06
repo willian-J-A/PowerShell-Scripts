@@ -10,6 +10,7 @@ import re
 import subprocess
 import unicodedata
 import copy
+import threading
 
 app = FastAPI()
 
@@ -24,6 +25,8 @@ STATE_BASE_PATH = Path(os.getenv("PROTOCOL_STATE_PATH", "runtime/protocols"))
 
 STATE_VERSION = "v3"
 SHORT_HISTORY_LIMIT = int(os.getenv("SHORT_HISTORY_LIMIT", "12"))
+_LOCKS_GUARD = threading.Lock()
+_PROTOCOL_LOCKS: Dict[str, threading.RLock] = {}
 
 ALLOWED_STATUS = {
     "INICIO", "IDENTIFICACAO", "TRIAGEM", "BASE_CONHECIMENTO", "FILA_N1",
@@ -204,6 +207,13 @@ def protocol_state_path(protocol: str) -> Path:
     return STATE_BASE_PATH / f"{safe_protocol}.json"
 
 
+def protocol_lock(protocol: str) -> threading.RLock:
+    with _LOCKS_GUARD:
+        if protocol not in _PROTOCOL_LOCKS:
+            _PROTOCOL_LOCKS[protocol] = threading.RLock()
+        return _PROTOCOL_LOCKS[protocol]
+
+
 def new_state(req: DecisionRequest) -> Dict[str, Any]:
     now = now_iso()
     return {
@@ -228,6 +238,9 @@ def new_state(req: DecisionRequest) -> Dict[str, Any]:
             "status": "INICIO",
             "intent": "",
             "tentativas": 0,
+            "respostas_uteis_cliente": 0,
+            "tentativas_mesma_intencao": 0,
+            "coletas_repetidas": 0,
             "triagem_concluida": False,
             "encerrado": False,
             "aguardando_validacao": False,
@@ -236,6 +249,13 @@ def new_state(req: DecisionRequest) -> Dict[str, Any]:
         "ticket": {"aberto": False, "ticket_id": None, "opened_at": None},
         "handoff": {"realizado": False, "motivo": None, "timestamp": None, "bot_silenciado": False},
         "agendamento": {"enviado": False, "timestamp": None},
+        "identificacao": {
+            "estado": "nao_iniciada",
+            "nome_coletado": bool(req.customer_name),
+            "empresa_coletada": bool(req.customer_company),
+            "confianca": 0.6 if (req.customer_name or req.customer_company) else 0.0,
+            "tentativas": 0,
+        },
         "solution": {"proposta": False, "validada": False, "solucionado": False},
         "last_execution": {"input_payload": {}, "decision_output": {}, "actions_taken": [], "event_id": ""},
     }
@@ -426,22 +446,11 @@ def apply_human_format(message: str, rules: Dict[str, Any]) -> str:
 
 
 def anti_loop_guard(state: Dict[str, Any], message: str, rules: Dict[str, Any], signals: Dict[str, Any]) -> str:
-    if not bool((rules.get("anti_loop", {}) or {}).get("enabled", True)):
-        return message
-
+    # Guardrail mínimo no backend: evitar apenas repetição literal imediata.
     prev = normalize_text(state["conversation"].get("last_bot_message", ""))
     curr = normalize_text(message)
-    last_user = normalize_text(state["conversation"].get("last_user_message", ""))
-
-    repeated = bool(prev and curr == prev)
-    generic_loop = any(p in curr for p in ["me conta um pouco mais", "pode me descrever melhor", "me conte mais"])
-
-    if repeated or (generic_loop and signals.get("has_diagnostic_hint") and last_user):
-        variations = (rules.get("anti_loop", {}) or {}).get("fallback_variations", []) or []
-        if variations:
-            idx = int(state["workflow"].get("tentativas", 0)) % len(variations)
-            return variations[idx]
-        return "[BOT] Entendi 🙂 Qual mensagem de erro aparece para você?"
+    if prev and curr == prev:
+        return "[BOT] Entendi. Vou seguir por outro caminho para avançar no atendimento."
     return message
 
 
@@ -475,6 +484,8 @@ def build_prompt(state: Dict[str, Any], event: Dict[str, Any], signals: Dict[str
         },
         "kb_cliente_rules": client_data.get("rules", {}),
         "kb_cliente": client_data.get("kb", {}),
+        "kb_active": event["raw_payload"].get("kb_active", []),
+        "identificacao": state.get("identificacao", {}),
     }
 
     return f"""Você interpreta mensagens para um workflow DigiSAC e retorna SOMENTE JSON válido.
@@ -486,6 +497,9 @@ Restrições operacionais:
 - Não afirme execução de ações.
 - Inicie mensagem com [BOT].
 - Preserve o contrato JSON já definido.
+- Você é responsável por avaliar repetição SEMÂNTICA e mudança de trilha.
+- Se a pergunta anterior já foi respondida, não repita a mesma intenção com outras palavras.
+- Use identificação progressiva: não peça novamente dados já coletados.
 
 Contexto:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
@@ -549,6 +563,8 @@ def build_contexto_atualizado(state: Dict[str, Any], event_type: str) -> Dict[st
             "ultima_solicitacao_tipo": state["workflow"].get("ultima_solicitacao_tipo", ""),
             "tentativas": int(state["workflow"].get("tentativas", 0)),
         },
+        "identificacao_estado": state.get("identificacao", {}).get("estado", "nao_iniciada"),
+        "identificacao_confianca": state.get("identificacao", {}).get("confianca", 0.0),
         "last_bot_message": normalize_text(state["conversation"].get("last_bot_message", "")),
     }
 
@@ -720,13 +736,34 @@ def persist_decision(state: Dict[str, Any], event: Dict[str, Any], decision: Dic
     else:
         msg = apply_human_format(anti_loop_guard(state, decision["mensagem"], rules, signals), rules)
 
+    prev_intent = state["workflow"].get("intent", "")
+    prev_request_type = state["workflow"].get("ultima_solicitacao_tipo", "")
     state["workflow"]["status"] = decision["status"]
     state["workflow"]["intent"] = decision["intent"]
     should_increment_attempt = bool(event.get("customer_turn_recorded")) and bool(event.get("customer_turn_useful"))
     if should_increment_attempt:
         state["workflow"]["tentativas"] = int(state["workflow"].get("tentativas", 0)) + 1
+        state["workflow"]["respostas_uteis_cliente"] = int(state["workflow"].get("respostas_uteis_cliente", 0)) + 1
+    if prev_intent and prev_intent == decision["intent"]:
+        state["workflow"]["tentativas_mesma_intencao"] = int(state["workflow"].get("tentativas_mesma_intencao", 0)) + 1
     state["workflow"]["encerrado"] = bool(state["workflow"].get("encerrado") or decision["status"] == "ENCERRADO")
     state["workflow"]["ultima_solicitacao_tipo"] = infer_request_type(decision["status"], msg, state["workflow"].get("ultima_solicitacao_tipo", ""))
+    if prev_request_type and prev_request_type == state["workflow"]["ultima_solicitacao_tipo"]:
+        state["workflow"]["coletas_repetidas"] = int(state["workflow"].get("coletas_repetidas", 0)) + 1
+
+    ident = state.get("identificacao", {})
+    ident["nome_coletado"] = bool(state["customer"].get("name"))
+    ident["empresa_coletada"] = bool(state["customer"].get("company"))
+    ident["tentativas"] = int(ident.get("tentativas", 0)) + (1 if decision["status"] == "IDENTIFICACAO" else 0)
+    if decision["status"] != "IDENTIFICACAO" and (ident.get("nome_coletado") or ident.get("empresa_coletada")):
+        ident["estado"] = "concluida"
+        ident["confianca"] = max(float(ident.get("confianca", 0.0)), 0.8)
+    elif decision["status"] == "IDENTIFICACAO" and (ident.get("nome_coletado") or ident.get("empresa_coletada")):
+        ident["estado"] = "parcial"
+        ident["confianca"] = max(float(ident.get("confianca", 0.0)), 0.5)
+    elif decision["status"] == "IDENTIFICACAO":
+        ident["estado"] = "nao_iniciada"
+    state["identificacao"] = ident
 
     if decision["abrir_ticket"] and not state["ticket"].get("aberto"):
         state["ticket"]["aberto"] = True
@@ -787,60 +824,61 @@ def persist_decision(state: Dict[str, Any], event: Dict[str, Any], decision: Dic
 
 
 def run_decision(req: DecisionRequest) -> Dict[str, Any]:
-    rules = load_decision_rules()
-    bot_rules = load_bot_rules()
-    client_data = load_client_data(req)
+    with protocol_lock(req.protocol):
+        rules = load_decision_rules()
+        bot_rules = load_bot_rules()
+        client_data = load_client_data(req)
 
-    state = load_protocol_state(req)
-    event = normalize_event(req)
+        state = load_protocol_state(req)
+        event = normalize_event(req)
 
-    # idempotência por evento
-    if state.get("last_execution", {}).get("event_id") == event["event_id"] and state.get("last_execution", {}).get("decision_output"):
-        replay = copy.deepcopy(state["last_execution"]["decision_output"])
-        replay["meta"]["source"] = "idempotent_replay"
-        return replay
+        # idempotência por evento
+        if state.get("last_execution", {}).get("event_id") == event["event_id"] and state.get("last_execution", {}).get("decision_output"):
+            replay = copy.deepcopy(state["last_execution"]["decision_output"])
+            replay["meta"]["source"] = "idempotent_replay"
+            return replay
 
-    state = consolidate_state(state, event)
-    signals = detect_signals(state, event, rules)
+        state = consolidate_state(state, event)
+        signals = detect_signals(state, event, rules)
 
-    if state.get("handoff", {}).get("realizado") and state.get("handoff", {}).get("bot_silenciado", False):
-        handoff_live = {
-            "status": "FILA_N1",
-            "intent": "handoff_em_andamento",
-            "mensagem": "",
-            "confidence": 1.0,
-            "abrir_ticket": False,
-            "agendar": False,
-            "handoff_humano": False,
-            "actions_taken": ["bot_silenced_after_handoff"],
-        }
-        final = apply_guardrails_to_decision(state, handoff_live, rules)
-        return persist_decision(state, event, final, rules, signals, source="handoff_lock", fallback_used=False)
+        if state.get("handoff", {}).get("realizado") and state.get("handoff", {}).get("bot_silenciado", False):
+            handoff_live = {
+                "status": "FILA_N1",
+                "intent": "handoff_em_andamento",
+                "mensagem": "",
+                "confidence": 1.0,
+                "abrir_ticket": False,
+                "agendar": False,
+                "handoff_humano": False,
+                "actions_taken": ["bot_silenced_after_handoff"],
+            }
+            final = apply_guardrails_to_decision(state, handoff_live, rules)
+            return persist_decision(state, event, final, rules, signals, source="handoff_lock", fallback_used=False)
 
-    hard = hard_rules_decision(state, event, signals, rules, client_data)
-    if hard:
-        final = apply_guardrails_to_decision(state, hard, rules)
-        return persist_decision(state, event, final, rules, signals, source="hard_rules", fallback_used=False)
+        hard = hard_rules_decision(state, event, signals, rules, client_data)
+        if hard:
+            final = apply_guardrails_to_decision(state, hard, rules)
+            return persist_decision(state, event, final, rules, signals, source="hard_rules", fallback_used=False)
 
-    # caminho único da IA -> guardrails -> persistência
-    try:
-        ai = call_openclaw(state, event, signals, rules, bot_rules, client_data)
-    except Exception:
-        ai = {
-            "status": "TRIAGEM",
-            "intent": "fallback_local",
-            "mensagem": "[BOT] Entendi 🙂 Para avançar, você consegue me dizer quando esse problema começou?",
-            "confidence": 0.55,
-            "abrir_ticket": False,
-            "agendar": False,
-            "handoff_humano": False,
-            "actions_taken": ["fallback_response"],
-        }
+        # caminho único da IA -> guardrails -> persistência
+        try:
+            ai = call_openclaw(state, event, signals, rules, bot_rules, client_data)
+        except Exception:
+            ai = {
+                "status": "TRIAGEM",
+                "intent": "fallback_local",
+                "mensagem": "[BOT] Entendi 🙂 Para avançar, você consegue me dizer quando esse problema começou?",
+                "confidence": 0.55,
+                "abrir_ticket": False,
+                "agendar": False,
+                "handoff_humano": False,
+                "actions_taken": ["fallback_response"],
+            }
+            final = apply_guardrails_to_decision(state, ai, rules)
+            return persist_decision(state, event, final, rules, signals, source="bridge_fallback_v3", fallback_used=True)
+
         final = apply_guardrails_to_decision(state, ai, rules)
-        return persist_decision(state, event, final, rules, signals, source="bridge_fallback_v3", fallback_used=True)
-
-    final = apply_guardrails_to_decision(state, ai, rules)
-    return persist_decision(state, event, final, rules, signals, source="openclaw_cli_v2_1", fallback_used=False)
+        return persist_decision(state, event, final, rules, signals, source="openclaw_cli_v2_1", fallback_used=False)
 
 
 @app.get("/health")
