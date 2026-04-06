@@ -256,6 +256,9 @@ def new_state(req: DecisionRequest) -> Dict[str, Any]:
             "confianca": 0.6 if (req.customer_name or req.customer_company) else 0.0,
             "tentativas": 0,
         },
+        "client_profile": {
+            "kb_active": [],
+        },
         "solution": {"proposta": False, "validada": False, "solucionado": False},
         "last_execution": {"input_payload": {}, "decision_output": {}, "actions_taken": [], "event_id": ""},
     }
@@ -350,6 +353,9 @@ def consolidate_state(state: Dict[str, Any], event: Dict[str, Any]) -> Dict[str,
         state["customer"]["name"] = event["customer_name"]
     if event["customer_company"]:
         state["customer"]["company"] = event["customer_company"]
+    incoming_kb_active = event.get("raw_payload", {}).get("kb_active", [])
+    if isinstance(incoming_kb_active, list) and incoming_kb_active:
+        state["client_profile"]["kb_active"] = incoming_kb_active
 
     if not event["is_automatic"] and event["author"] in {"customer", "client", "usuario", "user"} and event["message_text"]:
         state["conversation"]["last_user_message"] = event["message_text"]
@@ -484,7 +490,7 @@ def build_prompt(state: Dict[str, Any], event: Dict[str, Any], signals: Dict[str
         },
         "kb_cliente_rules": client_data.get("rules", {}),
         "kb_cliente": client_data.get("kb", {}),
-        "kb_active": event["raw_payload"].get("kb_active", []),
+        "kb_active": state.get("client_profile", {}).get("kb_active", []),
         "identificacao": state.get("identificacao", {}),
     }
 
@@ -500,6 +506,10 @@ Restrições operacionais:
 - Você é responsável por avaliar repetição SEMÂNTICA e mudança de trilha.
 - Se a pergunta anterior já foi respondida, não repita a mesma intenção com outras palavras.
 - Use identificação progressiva: não peça novamente dados já coletados.
+- Retorne também um bloco \"analysis\" com:
+  - same_diagnostic_path (bool)
+  - user_answered_previous (bool)
+  - should_change_path (bool)
 
 Contexto:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
@@ -534,16 +544,30 @@ def validate_ai_response(obj: Dict[str, Any]) -> Dict[str, Any]:
     conf = float(obj["confidence"])
     if conf < 0 or conf > 1:
         raise ValueError("confidence out of range")
+    analysis = obj.get("analysis")
+    if analysis is None or not isinstance(analysis, dict):
+        obj["analysis"] = {
+            "same_diagnostic_path": False,
+            "user_answered_previous": False,
+            "should_change_path": False,
+        }
+    else:
+        obj["analysis"] = {
+            "same_diagnostic_path": bool(analysis.get("same_diagnostic_path", False)),
+            "user_answered_previous": bool(analysis.get("user_answered_previous", False)),
+            "should_change_path": bool(analysis.get("should_change_path", False)),
+        }
     return obj
 
 
 def build_contexto_atualizado(state: Dict[str, Any], event_type: str) -> Dict[str, Any]:
+    identificado = state.get("identificacao", {}).get("estado") == "concluida"
     return {
         "protocolo": state["protocol"],
         "numero": state["customer"].get("id", ""),
         "nome": state["customer"].get("name", ""),
         "empresa": state["customer"].get("company", ""),
-        "identificado": False,
+        "identificado": identificado,
         "triagem_concluida": bool(state["workflow"].get("triagem_concluida", False)),
         "tentativas": int(state["workflow"].get("tentativas", 0)),
         "ticket_aberto": bool(state["ticket"].get("aberto", False)),
@@ -670,6 +694,34 @@ def call_openclaw(state: Dict[str, Any], event: Dict[str, Any], signals: Dict[st
     return ai
 
 
+def build_contextual_fallback(state: Dict[str, Any]) -> Dict[str, Any]:
+    last_intent = state.get("workflow", {}).get("intent", "")
+    last_question = state.get("conversation", {}).get("ultima_pergunta_bot", "")
+    if "impressora" in normalize_text(state.get("conversation", {}).get("last_user_message", "")):
+        msg = "[BOT] Para avançar rápido: sua impressora está por USB ou rede/Wi‑Fi?"
+    elif "identificacao" in normalize_text(last_intent):
+        msg = "[BOT] Para continuar seu atendimento, me confirme seu nome completo e empresa."
+    elif last_question:
+        msg = "[BOT] Entendi. Sobre sua última resposta, consegue detalhar um pouco mais esse ponto?"
+    else:
+        msg = "[BOT] Entendi 🙂 Para avançar, você consegue me dizer quando esse problema começou?"
+    return {
+        "status": state.get("workflow", {}).get("status", "TRIAGEM") or "TRIAGEM",
+        "intent": "fallback_local",
+        "mensagem": msg,
+        "confidence": 0.55,
+        "abrir_ticket": False,
+        "agendar": False,
+        "handoff_humano": False,
+        "actions_taken": ["fallback_response_contextual"],
+        "analysis": {
+            "same_diagnostic_path": False,
+            "user_answered_previous": False,
+            "should_change_path": True,
+        },
+    }
+
+
 def apply_guardrails_to_decision(state: Dict[str, Any], raw: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
     status = raw.get("status") or raw.get("status_sugerido") or "TRIAGEM"
     intent = raw.get("intent", "fallback_local")
@@ -726,6 +778,7 @@ def apply_guardrails_to_decision(state: Dict[str, Any], raw: Dict[str, Any], rul
         "handoff_humano": handoff,
         "actions_taken": actions_taken,
         "raw_output_excerpt": raw.get("_raw_excerpt", ""),
+        "analysis": raw.get("analysis", {}),
     }
 
 
@@ -755,7 +808,7 @@ def persist_decision(state: Dict[str, Any], event: Dict[str, Any], decision: Dic
     ident["nome_coletado"] = bool(state["customer"].get("name"))
     ident["empresa_coletada"] = bool(state["customer"].get("company"))
     ident["tentativas"] = int(ident.get("tentativas", 0)) + (1 if decision["status"] == "IDENTIFICACAO" else 0)
-    if decision["status"] != "IDENTIFICACAO" and (ident.get("nome_coletado") or ident.get("empresa_coletada")):
+    if decision["status"] != "IDENTIFICACAO" and ident.get("nome_coletado") and ident.get("empresa_coletada"):
         ident["estado"] = "concluida"
         ident["confianca"] = max(float(ident.get("confianca", 0.0)), 0.8)
     elif decision["status"] == "IDENTIFICACAO" and (ident.get("nome_coletado") or ident.get("empresa_coletada")):
@@ -807,6 +860,7 @@ def persist_decision(state: Dict[str, Any], event: Dict[str, Any], decision: Dic
             "state_persisted": True,
             "state_version": STATE_VERSION,
             "raw_output_excerpt": decision.get("raw_output_excerpt", "")[:220],
+            "analysis": decision.get("analysis", {}),
         },
     }
 
@@ -864,16 +918,7 @@ def run_decision(req: DecisionRequest) -> Dict[str, Any]:
         try:
             ai = call_openclaw(state, event, signals, rules, bot_rules, client_data)
         except Exception:
-            ai = {
-                "status": "TRIAGEM",
-                "intent": "fallback_local",
-                "mensagem": "[BOT] Entendi 🙂 Para avançar, você consegue me dizer quando esse problema começou?",
-                "confidence": 0.55,
-                "abrir_ticket": False,
-                "agendar": False,
-                "handoff_humano": False,
-                "actions_taken": ["fallback_response"],
-            }
+            ai = build_contextual_fallback(state)
             final = apply_guardrails_to_decision(state, ai, rules)
             return persist_decision(state, event, final, rules, signals, source="bridge_fallback_v3", fallback_used=True)
 
