@@ -438,6 +438,7 @@ def detect_signals(state: Dict[str, Any], event: Dict[str, Any], rules: Dict[str
         "text": text,
         "text_no_accent": text_no_accent,
         "only_greeting": text_no_accent in greetings,
+        "has_diagnostic_hint": any(term in text_no_accent for term in diagnostic_terms),
         "pediu_tecnico_especifico": fuzzy_contains_tech_name(text, rules),
         "cliente_irritado": any(term in text_no_accent for term in irritation_terms),
         "pedido_humano_explicito": any(term in text_no_accent for term in force_handoff_terms),
