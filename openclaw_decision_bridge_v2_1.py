@@ -672,6 +672,10 @@ def apply_guardrails_to_decision(state: Dict[str, Any], raw: Dict[str, Any], rul
         agendar = True
         handoff = False
 
+    if status not in ALLOWED_STATUS:
+        status = "TRIAGEM"
+        actions_taken.append("invalid_status_normalized")
+
     if state["workflow"].get("encerrado") and status != "ENCERRADO":
         status = "ENCERRADO"
         intent = "closed_already"
@@ -784,12 +788,11 @@ def run_decision(req: DecisionRequest) -> Dict[str, Any]:
         final = apply_guardrails_to_decision(state, hard, rules)
         return persist_decision(state, event, final, rules, signals, source="hard_rules", fallback_used=False)
 
+    # caminho único da IA -> guardrails -> persistência
     try:
         ai = call_openclaw(state, event, signals, rules, bot_rules, client_data)
-        final = apply_guardrails_to_decision(state, ai, rules)
-        return persist_decision(state, event, final, rules, signals, source="openclaw_cli_v2_1", fallback_used=False)
     except Exception:
-        fallback = {
+        ai = {
             "status": "TRIAGEM",
             "intent": "fallback_local",
             "mensagem": "[BOT] Entendi 🙂 Para avançar, você consegue me dizer quando esse problema começou?",
@@ -799,8 +802,11 @@ def run_decision(req: DecisionRequest) -> Dict[str, Any]:
             "handoff_humano": False,
             "actions_taken": ["fallback_response"],
         }
-        final = apply_guardrails_to_decision(state, fallback, rules)
+        final = apply_guardrails_to_decision(state, ai, rules)
         return persist_decision(state, event, final, rules, signals, source="bridge_fallback_v3", fallback_used=True)
+
+    final = apply_guardrails_to_decision(state, ai, rules)
+    return persist_decision(state, event, final, rules, signals, source="openclaw_cli_v2_1", fallback_used=False)
 
 
 @app.get("/health")
