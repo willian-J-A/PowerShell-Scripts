@@ -234,7 +234,7 @@ def new_state(req: DecisionRequest) -> Dict[str, Any]:
             "ultima_solicitacao_tipo": "",
         },
         "ticket": {"aberto": False, "ticket_id": None, "opened_at": None},
-        "handoff": {"realizado": False, "motivo": None, "timestamp": None},
+        "handoff": {"realizado": False, "motivo": None, "timestamp": None, "bot_silenciado": False},
         "agendamento": {"enviado": False, "timestamp": None},
         "solution": {"proposta": False, "validada": False, "solucionado": False},
         "last_execution": {"input_payload": {}, "decision_output": {}, "actions_taken": [], "event_id": ""},
@@ -300,16 +300,27 @@ def normalize_event(req: DecisionRequest) -> Dict[str, Any]:
     }
 
 
-def append_history(state: Dict[str, Any], role: str, text: str, timestamp: str, source: str) -> None:
+def append_history(state: Dict[str, Any], role: str, text: str, timestamp: str, source: str) -> bool:
     item = {"role": role, "text": text, "timestamp": timestamp, "source": source}
     hist = state["conversation"]["historico_completo"]
     if hist and hist[-1].get("role") == role and normalize_text(hist[-1].get("text", "")) == normalize_text(text):
-        return
+        return False
     hist.append(item)
     short = state["conversation"]["historico_curto"]
     short.append({"role": role, "text": text})
     if len(short) > SHORT_HISTORY_LIMIT:
         state["conversation"]["historico_curto"] = short[-SHORT_HISTORY_LIMIT:]
+    return True
+
+
+def is_useful_customer_text(text: str) -> bool:
+    normalized = normalize_text(text)
+    if len(normalized) < 3:
+        return False
+    low_value = {
+        "ok", "blz", "sim", "nao", "não", "obrigado", "obrigada", "valeu", "show", "👍", "👍🏻", "👍🏽", "👍🏿"
+    }
+    return normalized not in low_value
 
 
 def consolidate_state(state: Dict[str, Any], event: Dict[str, Any]) -> Dict[str, Any]:
@@ -323,7 +334,11 @@ def consolidate_state(state: Dict[str, Any], event: Dict[str, Any]) -> Dict[str,
     if not event["is_automatic"] and event["author"] in {"customer", "client", "usuario", "user"} and event["message_text"]:
         state["conversation"]["last_user_message"] = event["message_text"]
         state["conversation"]["ultima_resposta_cliente"] = event["message_text"]
-        append_history(state, "user", event["message_text"], event["timestamp"], event["channel"])
+        event["customer_turn_recorded"] = append_history(state, "user", event["message_text"], event["timestamp"], event["channel"])
+        event["customer_turn_useful"] = is_useful_customer_text(event["message_text"])
+    else:
+        event["customer_turn_recorded"] = False
+        event["customer_turn_useful"] = False
 
     return state
 
@@ -707,7 +722,9 @@ def persist_decision(state: Dict[str, Any], event: Dict[str, Any], decision: Dic
 
     state["workflow"]["status"] = decision["status"]
     state["workflow"]["intent"] = decision["intent"]
-    state["workflow"]["tentativas"] = int(state["workflow"].get("tentativas", 0)) + (0 if event["is_automatic"] else 1)
+    should_increment_attempt = bool(event.get("customer_turn_recorded")) and bool(event.get("customer_turn_useful"))
+    if should_increment_attempt:
+        state["workflow"]["tentativas"] = int(state["workflow"].get("tentativas", 0)) + 1
     state["workflow"]["encerrado"] = bool(state["workflow"].get("encerrado") or decision["status"] == "ENCERRADO")
     state["workflow"]["ultima_solicitacao_tipo"] = infer_request_type(decision["status"], msg, state["workflow"].get("ultima_solicitacao_tipo", ""))
 
@@ -719,6 +736,7 @@ def persist_decision(state: Dict[str, Any], event: Dict[str, Any], decision: Dic
         state["handoff"]["realizado"] = True
         state["handoff"]["motivo"] = decision["intent"]
         state["handoff"]["timestamp"] = now_iso()
+        state["handoff"]["bot_silenciado"] = True
 
     if decision["agendar"]:
         state["agendamento"]["enviado"] = True
@@ -763,6 +781,8 @@ def persist_decision(state: Dict[str, Any], event: Dict[str, Any], decision: Dic
     }
 
     save_protocol_state(event["protocol"], state)
+    if decision["status"] == "ENCERRADO":
+        archive_protocol_state(event["protocol"])
     return output
 
 
@@ -782,6 +802,20 @@ def run_decision(req: DecisionRequest) -> Dict[str, Any]:
 
     state = consolidate_state(state, event)
     signals = detect_signals(state, event, rules)
+
+    if state.get("handoff", {}).get("realizado") and state.get("handoff", {}).get("bot_silenciado", False):
+        handoff_live = {
+            "status": "FILA_N1",
+            "intent": "handoff_em_andamento",
+            "mensagem": "",
+            "confidence": 1.0,
+            "abrir_ticket": False,
+            "agendar": False,
+            "handoff_humano": False,
+            "actions_taken": ["bot_silenced_after_handoff"],
+        }
+        final = apply_guardrails_to_decision(state, handoff_live, rules)
+        return persist_decision(state, event, final, rules, signals, source="handoff_lock", fallback_used=False)
 
     hard = hard_rules_decision(state, event, signals, rules, client_data)
     if hard:
