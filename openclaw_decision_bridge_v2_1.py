@@ -730,6 +730,8 @@ def apply_guardrails_to_decision(state: Dict[str, Any], raw: Dict[str, Any], rul
     handoff = bool(raw.get("handoff_humano") if "handoff_humano" in raw else raw.get("recomenda_handoff_humano", False))
     abrir_ticket = bool(raw.get("abrir_ticket") if "abrir_ticket" in raw else raw.get("recomenda_abrir_ticket", False))
     agendar = bool(raw.get("agendar") if "agendar" in raw else raw.get("recomenda_agendamento", False))
+    analysis = raw.get("analysis", {}) or {}
+    should_change_path = bool(analysis.get("should_change_path", False))
 
     actions_taken: List[str] = []
 
@@ -755,6 +757,29 @@ def apply_guardrails_to_decision(state: Dict[str, Any], raw: Dict[str, Any], rul
         agendar = True
         handoff = False
 
+    # Telemetria semântica da IA passa a influenciar guardrails operacionais.
+    if should_change_path and not handoff:
+        status = "TRIAGEM"
+        intent = "mudanca_trilha_semantica"
+        mensagem = "[BOT] Entendi. Vou mudar a abordagem para avançarmos melhor: qual é o impacto agora, total ou parcial?"
+        actions_taken.append("semantic_path_change_applied")
+
+    # Contadores operacionais passam a dirigir quebra de repetição.
+    if (int(state["workflow"].get("tentativas_mesma_intencao", 0)) >= 2 or int(state["workflow"].get("coletas_repetidas", 0)) >= 2) and not handoff:
+        status = "TRIAGEM"
+        intent = "quebra_repeticao_operacional"
+        mensagem = "[BOT] Para destravar, vamos por outro caminho: isso está parando sua operação totalmente ou parcialmente?"
+        actions_taken.append("operational_path_break")
+
+    # Evita ficar preso no subfluxo de identificação indefinidamente.
+    if status == "IDENTIFICACAO":
+        ident = state.get("identificacao", {}) or {}
+        if int(ident.get("tentativas", 0)) >= 2 and int(state["workflow"].get("respostas_uteis_cliente", 0)) >= 2:
+            status = "TRIAGEM"
+            intent = "identificacao_parcial_avancar"
+            mensagem = "[BOT] Vamos avançar com o atendimento e completar seus dados em seguida, tudo bem?"
+            actions_taken.append("identification_exit_guard")
+
     if status not in ALLOWED_STATUS:
         status = "TRIAGEM"
         actions_taken.append("invalid_status_normalized")
@@ -778,7 +803,7 @@ def apply_guardrails_to_decision(state: Dict[str, Any], raw: Dict[str, Any], rul
         "handoff_humano": handoff,
         "actions_taken": actions_taken,
         "raw_output_excerpt": raw.get("_raw_excerpt", ""),
-        "analysis": raw.get("analysis", {}),
+        "analysis": analysis,
     }
 
 
@@ -803,6 +828,9 @@ def persist_decision(state: Dict[str, Any], event: Dict[str, Any], decision: Dic
     state["workflow"]["ultima_solicitacao_tipo"] = infer_request_type(decision["status"], msg, state["workflow"].get("ultima_solicitacao_tipo", ""))
     if prev_request_type and prev_request_type == state["workflow"]["ultima_solicitacao_tipo"]:
         state["workflow"]["coletas_repetidas"] = int(state["workflow"].get("coletas_repetidas", 0)) + 1
+    if bool(decision.get("analysis", {}).get("should_change_path", False)):
+        state["workflow"]["tentativas_mesma_intencao"] = 0
+        state["workflow"]["coletas_repetidas"] = 0
 
     ident = state.get("identificacao", {})
     ident["nome_coletado"] = bool(state["customer"].get("name"))
